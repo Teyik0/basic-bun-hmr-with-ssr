@@ -2,7 +2,7 @@
 
 ## Goals
 
-- SSR with React (`renderToString`)
+- SSR with React (`renderToReadableStream`)
 - Bun's native HMR (hot module replacement) preserved
 - No extra fetch round-trip for initial data
 - No second process, no reverse proxy, single port
@@ -28,12 +28,12 @@ Bun-processed version, which has the correct bundle paths already rewritten.
 
 ---
 
-## The Trick — Elysia + `serve.routes`
+## The Trick — `@elysiajs/static` under the hood
 
-Elysia wraps `Bun.serve()` internally. Its source skips wildcard routes when
-building `Bun.serve()`'s native `routes` object (charCode 42 = `*`), keeping
-them as the `fetch` fallback instead. And it merges `app.config.serve?.routes`
-directly into `Bun.serve()`:
+Elysia's static plugin (`@elysiajs/static`) works by injecting routes directly
+into `Bun.serve()`'s native `routes` map not into the `fetch` fallback.
+Elysia merges `app.config.serve?.routes` into that same map when it calls
+`Bun.serve()` internally:
 
 ```ts
 // elysia/dist/adapter/bun/index.js (simplified)
@@ -41,30 +41,23 @@ Bun.serve({
   routes: mergeRoutes(
     elysiaStaticRoutes,
     elysiaFetchHandlerRoutes,
-    app.config.serve?.routes,   // ← our HTML bundle goes here
+    app.config.serve?.routes, // ← our HTML bundle goes here
   ),
-  fetch: app.fetch,             // ← Elysia's wildcard lives here
+  fetch: app.fetch, // ← Elysia's wildcard lives here
 });
 ```
 
-**Bun routes always take priority over `fetch`.** So anything Bun registers
-(JS bundles, HMR WebSocket) is never seen by Elysia's wildcard handler.
+**Bun routes always win over `fetch`.** Anything in `routes` — JS chunks, the
+HMR WebSocket — is served by Bun before Elysia's wildcard ever runs.
 
-```ts
-const app = new Elysia({
-  serve: {
-    routes: {
-      "/_bun_entry": indexHtml,  // ← import indexHtml from "./pages/index.html"
-    },
-  },
-})
-```
+By passing an HTML import through `serve.routes` we use that same mechanism.
+Bun treats the entry as a native route, runs its full bundler pipeline on the
+file, and automatically registers all derived chunk paths. Concretely, it:
 
-This one line tells Bun to:
-1. Bundle `frontend.tsx` and all its dependencies
-2. Serve the resulting JS chunks at their registered paths
-3. Set up the HMR WebSocket
-4. Handle all of the above before Elysia's `fetch` handler ever runs
+1. Bundles `frontend.tsx` and all its dependencies
+2. Serves the resulting JS chunks at their hashed paths
+3. Sets up the HMR WebSocket
+4. Does all of the above before Elysia's `fetch` handler ever runs
 
 ---
 
@@ -81,7 +74,10 @@ function getTemplate(): Promise<string> {
   if (!bundleTemplatePromise) {
     bundleTemplatePromise = fetch(`http://localhost:${PORT}/_bun_entry`)
       .then((r) => r.text())
-      .catch((err) => { bundleTemplatePromise = null; throw err; });
+      .catch((err) => {
+        bundleTemplatePromise = null;
+        throw err;
+      });
   }
   return bundleTemplatePromise;
 }
@@ -97,13 +93,13 @@ cached template stays valid across hot reloads.
 
 ## Request Routing Table
 
-| Request | Who handles it | Result |
-|---|---|---|
-| `GET /_bun_entry` | Bun route | Raw bundled HTML (used as template) |
-| `GET /_bun/chunk-*.js` | Bun (auto-registered) | Bundled JS |
-| `WS /_bun/hmr` | Bun (auto-registered) | HMR WebSocket |
-| `GET /public/*` | Elysia static plugin | Static assets |
-| `GET /`, `/about`, … | Elysia `GET("*")` fallback | SSR-injected HTML |
+| Request                | Who handles it             | Result                              |
+| ---------------------- | -------------------------- | ----------------------------------- |
+| `GET /_bun_entry`      | Bun route                  | Raw bundled HTML (used as template) |
+| `GET /_bun/chunk-*.js` | Bun (auto-registered)      | Bundled JS                          |
+| `WS /_bun/hmr`         | Bun (auto-registered)      | HMR WebSocket                       |
+| `GET /public/*`        | Elysia static plugin       | Static assets                       |
+| `GET /`, `/about`, …   | Elysia `GET("*")` fallback | SSR-injected HTML                   |
 
 ---
 
@@ -113,7 +109,9 @@ State is serialized directly into the HTML response:
 
 ```html
 <div id="root"><!-- server-rendered markup --></div>
-<script>window.__SSR__ = { url: "/about" };</script>
+<script>
+  window.__SSR__ = { url: "/about" };
+</script>
 ```
 
 The client reads it immediately on load — no extra network request, no
@@ -125,7 +123,11 @@ waterfall, no flash of unstyled content.
 
 ```tsx
 const url = window.__SSR__?.url ?? window.location.pathname;
-const app = <StrictMode><App url={url} /></StrictMode>;
+const app = (
+  <StrictMode>
+    <App url={url} />
+  </StrictMode>
+);
 
 if (import.meta.hot) {
   // HMR: reuse the existing root across hot reloads
@@ -134,9 +136,9 @@ if (import.meta.hot) {
     : createRoot(elem));
   root.render(app);
 } else if (elem.innerHTML.trim()) {
-  hydrateRoot(elem, app);   // SSR: attach to existing DOM
+  hydrateRoot(elem, app); // SSR: attach to existing DOM
 } else {
-  createRoot(elem).render(app);  // CSR fallback
+  createRoot(elem).render(app); // CSR fallback
 }
 ```
 
